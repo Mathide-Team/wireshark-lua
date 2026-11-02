@@ -91,6 +91,6 @@ ou TCP, l'heuristique `dji_dumlv1` s'applique seule. Filtres :
   `dji_*_main_dissector`) ; formats d'enregistrement de vol, batterie et
   export KML non essayés ; pas de capture réelle disponible.
 - L'issue #528 (honglan3/dji-sdk-dji-firmware-tools) vise une copie du
-  même dépôt datée d'avril 2019, non déclarée comme fork : 8 des 14
-  scripts y sont identiques, les 6 autres sont des versions plus
+  même dépôt datée d'avril 2019, non déclarée comme fork : 7 des 14
+  scripts y sont identiques, les 7 autres sont des versions plus
   anciennes.
