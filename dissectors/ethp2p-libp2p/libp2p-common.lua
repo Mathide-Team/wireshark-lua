@@ -1,0 +1,321 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Importé de https://github.com/ethp2p/wireshark-dissectors (libp2p-common.lua),
+-- commit 08356b26fc48506e3ac84fea017ad83e83449409 du 23/03/2026.
+-- Licence amont : AGPL-3.0-only (LICENSE amont) — voir README.md.
+-- Shared utilities for libp2p Wireshark dissectors.
+-- Provides varint decoding, multistream-select parsing, per-stream reassembly,
+-- and multiaddr formatting.
+
+libp2p = libp2p or {}
+
+---------------------------------------------------------------------------
+-- Varint (operates on raw Lua strings, 1-based indexing)
+---------------------------------------------------------------------------
+
+function libp2p.decode_varint_str(s, idx)
+    if not s or idx < 1 or idx > #s then return 0, 0 end
+    local value = 0
+    local shift = 0
+    local pos = idx
+    while pos <= #s do
+        local b = s:byte(pos)
+        if not b then return 0, pos - idx end
+        value = bit.bor(value, bit.lshift(bit.band(b, 0x7F), shift))
+        pos = pos + 1
+        shift = shift + 7
+        if bit.band(b, 0x80) == 0 then
+            return value, pos - idx
+        end
+        if shift >= 35 then break end -- varint too long (>5 bytes for 32-bit)
+    end
+    return value, pos - idx
+end
+
+---------------------------------------------------------------------------
+-- Protobuf helper (1-based string indexing)
+---------------------------------------------------------------------------
+
+function libp2p.pb_each_str(s, from, to, visitor)
+    if not s or from < 1 or to > #s or from > to then return end
+    local pos = from
+    while pos <= to do
+        local tag, tc = libp2p.decode_varint_str(s, pos)
+        if tc == 0 then break end
+        pos = pos + tc
+        local field_number = bit.rshift(tag, 3)
+        local wire_type = bit.band(tag, 0x07)
+        if wire_type == 0 then
+            local val, vc = libp2p.decode_varint_str(s, pos)
+            if vc == 0 then break end
+            visitor(field_number, 0, pos, vc, val)
+            pos = pos + vc
+        elseif wire_type == 2 then
+            local dlen, dc = libp2p.decode_varint_str(s, pos)
+            if dc == 0 then break end
+            pos = pos + dc
+            if pos + dlen - 1 > to then break end
+            visitor(field_number, 2, pos, dlen, nil)
+            pos = pos + dlen
+        else
+            break
+        end
+    end
+end
+
+---------------------------------------------------------------------------
+-- Hex formatting
+---------------------------------------------------------------------------
+
+function libp2p.bytes_to_hex(s)
+    local hex = {}
+    for i = 1, #s do hex[i] = string.format("%02x", s:byte(i)) end
+    return table.concat(hex)
+end
+
+---------------------------------------------------------------------------
+-- Multiaddr formatting
+---------------------------------------------------------------------------
+
+local multiaddr_codecs = {
+    [4]   = { name = "ip4",     size = 4,  fmt = function(s, i) return string.format("%d.%d.%d.%d", s:byte(i), s:byte(i+1), s:byte(i+2), s:byte(i+3)) end },
+    [6]   = { name = "tcp",     size = 2,  fmt = function(s, i) return tostring(s:byte(i)*256 + s:byte(i+1)) end },
+    [273] = { name = "udp",     size = 2,  fmt = function(s, i) return tostring(s:byte(i)*256 + s:byte(i+1)) end },
+    [461] = { name = "quic-v1", size = 0 },
+}
+
+function libp2p.format_multiaddr(s)
+    local parts = {}
+    local pos = 1
+    while pos <= #s do
+        local code, consumed = libp2p.decode_varint_str(s, pos)
+        pos = pos + consumed
+        local codec = multiaddr_codecs[code]
+        if codec then
+            if codec.size > 0 and pos + codec.size - 1 <= #s then
+                table.insert(parts, "/" .. codec.name .. "/" .. codec.fmt(s, pos))
+                pos = pos + codec.size
+            elseif codec.size == 0 then
+                table.insert(parts, "/" .. codec.name)
+            else break end
+        else
+            table.insert(parts, string.format("/0x%x/...", code))
+            break
+        end
+    end
+    return table.concat(parts, "")
+end
+
+---------------------------------------------------------------------------
+-- Stream reassembly (post-dissector compatible, multi-pass safe)
+--
+-- We pair quic.stream.stream_id with quic.stream_data by index. Both are
+-- emitted once per STREAM frame in the packet, so they align 1:1.
+--
+-- We do NOT use quic.stream.offset because it is only emitted when the
+-- QUIC STREAM frame's O(ffset) bit is set (i.e. offset > 0). When a
+-- packet contains multiple STREAM frames and some have offset=0, the
+-- offset array is shorter than the id/data arrays and the pairing breaks.
+-- Instead we simply append each chunk to the stream buffer in wire order.
+-- This is correct as long as Wireshark feeds us frames in order, which
+-- it does for post-dissectors.
+---------------------------------------------------------------------------
+
+-- Per-stream state: { buf, protocol, payload_offset }
+libp2p._streams = {}
+
+-- Per-frame cached stable data (survives across passes):
+--   frame_number -> list of { stream_id, protocol, payload, prev_payload_len, buf_hex }
+-- buf_hex is the hex string for recreating a Tvb (Tvbs expire between passes).
+libp2p._frame_results = {}
+
+-- Track the highest frame number seen to detect pass resets.
+libp2p._max_frame = 0
+
+-- Field extractors.
+-- quic.stream.offset is only emitted when the QUIC STREAM frame's O bit is set
+-- (offset > 0). When a packet has multiple STREAM frames with mixed offset
+-- presence, the offset array is shorter than id/data arrays. We handle this
+-- by tracking expected offset per stream and using the offset field only for
+-- dedup/placement when available.
+libp2p._f_sid   = Field.new("quic.stream.stream_id")
+libp2p._f_soff  = Field.new("quic.stream.offset")
+libp2p._f_sdata = Field.new("quic.stream_data")
+libp2p._f_conn  = Field.new("quic.connection.number")
+
+local function parse_multistream(buf)
+    if not buf or #buf == 0 then return nil, 1 end
+    local pos = 1
+    local found_ms = false
+    while pos <= #buf do
+        local msg_len, consumed = libp2p.decode_varint_str(buf, pos)
+        if consumed == 0 or msg_len == 0 or pos + consumed + msg_len - 1 > #buf then
+            return nil, pos
+        end
+        local msg = buf:sub(pos + consumed, pos + consumed + msg_len - 1):gsub("\n$", "")
+        if msg == "/multistream/1.0.0" then
+            found_ms = true
+        elseif found_ms and msg:match("^/") then
+            return msg, pos + consumed + msg_len
+        else
+            return nil, pos
+        end
+        pos = pos + consumed + msg_len
+    end
+    return nil, pos
+end
+
+
+function libp2p.process_streams(pinfo)
+    local frame_num = pinfo.number
+
+    -- Detect pass reset.
+    if frame_num <= libp2p._max_frame and frame_num == 1 then
+        libp2p._streams = {}
+    end
+    if frame_num > libp2p._max_frame then
+        libp2p._max_frame = frame_num
+    end
+
+    -- Return cached results from a prior pass.
+    local cached = libp2p._frame_results[frame_num]
+    if cached then return cached end
+
+    -- First pass: read fields and accumulate stream data.
+    local ids   = { libp2p._f_sid() }
+    local offs  = { libp2p._f_soff() }
+    local datas = { libp2p._f_sdata() }
+    local conns = { libp2p._f_conn() }
+
+    if #ids == 0 then
+        libp2p._frame_results[frame_num] = {}
+        return {}
+    end
+
+    -- Connection number is per-packet (same for all STREAM frames in one packet).
+    local conn_num = conns[1] and tostring(conns[1].value) or "?"
+
+    local results = {}
+    local stable = {}
+
+    for i, id_fld in ipairs(ids) do
+        local sid = id_fld.value
+        local data_fld = datas[i]
+        if not data_fld or not data_fld.range then goto next end
+
+        local key = conn_num .. ":" .. tostring(sid)
+        local state = libp2p._streams[key]
+        if not state then
+            -- buf: the reassembled stream bytes (1-based string)
+            -- high_water: highest byte offset + 1 we've seen
+            -- contiguous: highest offset from 0 with no gaps (all bytes received)
+            -- segments: sorted list of {start, end} (0-based, exclusive end)
+            --           used to compute contiguous after each insertion
+            state = { buf = "", protocol = nil, payload_offset = 0,
+                      high_water = 0, contiguous = 0, segments = {} }
+            libp2p._streams[key] = state
+        end
+
+        -- Record previous payload length before placing new data.
+        local prev_pl = 0
+        if state.protocol and state.payload_offset > 0 and state.contiguous >= state.payload_offset then
+            prev_pl = state.contiguous - state.payload_offset + 1
+        end
+
+        local new_data = data_fld.range:raw()
+        local data_len = #new_data
+
+        -- Determine the 0-based stream offset for this data.
+        -- When #offs == #ids, they're 1:1 aligned.
+        -- When #offs < #ids, offsets are missing for streams with offset=0.
+        local data_offset
+        if #offs == #ids and offs[i] then
+            data_offset = tonumber(tostring(offs[i].value))
+        elseif #offs == 0 then
+            -- No offsets at all → all are implicit 0, but if we've already
+            -- received data, this must be the next chunk.
+            data_offset = state.high_water
+        else
+            -- Mixed: fall back to placing at high_water.
+            if state.high_water == 0 then
+                data_offset = 0
+            else
+                data_offset = state.high_water
+            end
+        end
+
+        local data_end = data_offset + data_len  -- exclusive, 0-based
+
+        -- Extend buffer if this data goes beyond current size.
+        if data_end > #state.buf then
+            state.buf = state.buf .. string.rep("\0", data_end - #state.buf)
+        end
+
+        -- Place data at the correct position (overwriting zeros or retransmit data).
+        -- 0-based data_offset → 1-based string index = data_offset + 1
+        state.buf = state.buf:sub(1, data_offset)
+                 .. new_data
+                 .. state.buf:sub(data_end + 1)
+
+        if data_end > state.high_water then
+            state.high_water = data_end
+        end
+
+        -- Merge this segment into the sorted segment list to track contiguous range.
+        local seg = state.segments
+        local new_seg = {data_offset, data_end}
+        -- Insert and merge overlapping/adjacent segments.
+        local merged = {}
+        local inserted = false
+        for _, s2 in ipairs(seg) do
+            if new_seg[1] <= s2[2] and new_seg[2] >= s2[1] then
+                -- Overlapping or adjacent — merge.
+                new_seg[1] = math.min(new_seg[1], s2[1])
+                new_seg[2] = math.max(new_seg[2], s2[2])
+            else
+                if not inserted and new_seg[2] < s2[1] then
+                    table.insert(merged, new_seg)
+                    inserted = true
+                end
+                table.insert(merged, s2)
+            end
+        end
+        if not inserted then
+            table.insert(merged, new_seg)
+        end
+        state.segments = merged
+
+        -- Update contiguous: the end of the first segment if it starts at 0.
+        if #merged > 0 and merged[1][1] == 0 then
+            state.contiguous = merged[1][2]
+        end
+
+        -- Parse multistream-select if not yet done (only from contiguous data).
+        if not state.protocol and state.contiguous > 0 then
+            local proto, after = parse_multistream(state.buf:sub(1, state.contiguous))
+            if proto then
+                state.protocol = proto
+                state.payload_offset = after
+            end
+        end
+
+        -- Extract application payload — only up to the contiguous range.
+        local payload = nil
+        if state.protocol and state.payload_offset > 0 and state.contiguous >= state.payload_offset then
+            payload = state.buf:sub(state.payload_offset, state.contiguous)
+        end
+
+        local entry = {
+            stream_id = sid,
+            protocol = state.protocol,
+            payload = payload,
+            prev_payload_len = prev_pl,
+        }
+        table.insert(stable, entry)
+        table.insert(results, entry)
+
+        ::next::
+    end
+
+    libp2p._frame_results[frame_num] = stable
+    return results
+end

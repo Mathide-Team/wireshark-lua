@@ -1,0 +1,14 @@
+// Syncthing (Local Discovery Protocol v4) Announce Message protocol buffer schema
+// https://docs.syncthing.net/specs/localdisco-v4.html
+
+// See: https://wiki.wireshark.org/Protobuf
+// and https://gitlab.com/wireshark/wireshark/-/wikis/Protobuf
+
+syntax = "proto3";
+package syncthing;
+
+message Announce {
+    bytes           id          = 1;
+    repeated string addresses   = 2;
+    int64           instance_id = 3;
+}
