@@ -9,6 +9,10 @@ Un sous-dossier par dissecteur dans `dissectors/<protocole>/` : les fichiers
 Lua importés tels quels de l'amont (en-tête SPDX + provenance ajouté), plus
 un `README.md` d'import (source, commit, licence amont, utilisation).
 
+Les amonts sont suivis par `scripts/verifier_mises_a_jour.py`, avec un
+rapport hebdomadaire (workflow « Mises à jour amont »). La procédure de mise
+à jour est décrite dans [docs/maintenance.md](docs/maintenance.md) (#766).
+
 ## Licence
 
 [GPL-3.0-or-later](LICENSE) — Wireshark lui-même est en GPL-2.0-or-later,

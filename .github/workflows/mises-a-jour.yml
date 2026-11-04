@@ -1,0 +1,39 @@
+name: Mises à jour amont
+
+# Issue #766 : chaque semaine (et à la demande), compare le commit importé de
+# chaque dissecteur (README, tableau « Import ») à la pointe de sa source git
+# et publie le rapport dans le résumé du job et en artefact. Non bloquant :
+# rien n'est importé automatiquement, chaque mise à jour reste une PR
+# d'import relue (convention #563). Procédure : docs/maintenance.md.
+
+"on":
+  schedule:
+    - cron: "17 5 * * 1"  # lundi, 5 h 17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  rapport:
+    name: "Rapport des mises à jour amont"
+    runs-on: ${{ fromJSON(vars.RUNS_ON_LINUX || '{"group":"maison","labels":["self-hosted","linux"]}') }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Interrogation des sources (git ls-remote)
+        run: |
+          python3 scripts/verifier_mises_a_jour.py --sortie rapport-mises-a-jour.md
+          cat rapport-mises-a-jour.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Artefact du rapport
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapport-mises-a-jour
+          path: rapport-mises-a-jour.md
+          retention-days: 30
