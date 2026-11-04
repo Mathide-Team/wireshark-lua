@@ -204,12 +204,10 @@ class MainTests(Base):
 
     def lancer(self, *args, pointe=SHA_B):
         sortie, erreurs = io.StringIO(), io.StringIO()
-        with (
-            unittest.mock.patch.object(maj, "ls_remote", lambda u, b: (pointe, "")),
-            redirect_stdout(sortie),
-            redirect_stderr(erreurs),
-        ):
-            code = maj.main(["--racine", str(self.racine), *args])
+        # Pas de « with ( … ) » parenthésé : Python 3.8 du runner maison.
+        with unittest.mock.patch.object(maj, "ls_remote", lambda u, b: (pointe, "")):
+            with redirect_stdout(sortie), redirect_stderr(erreurs):
+                code = maj.main(["--racine", str(self.racine), *args])
         return code, sortie.getvalue(), erreurs.getvalue()
 
     def test_markdown_et_strict(self) -> None:
